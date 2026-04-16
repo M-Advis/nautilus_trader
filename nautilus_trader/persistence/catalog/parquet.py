@@ -52,6 +52,7 @@ from nautilus_trader.core.nautilus_pyo3 import NautilusDataType
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import CustomData
 from nautilus_trader.model.data import DataType
+from nautilus_trader.model.data import InstrumentStatus
 from nautilus_trader.model.data import MarkPriceUpdate
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
@@ -66,7 +67,6 @@ from nautilus_trader.persistence.funcs import combine_filters
 from nautilus_trader.persistence.funcs import filename_to_class
 from nautilus_trader.persistence.funcs import urisafe_identifier
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
-from nautilus_trader.serialization.arrow.serializer import list_schemas
 
 
 TimestampLike = int | str | float
@@ -1103,28 +1103,27 @@ class ParquetDataCatalog(BaseDataCatalog):
                 "all files in the consolidation range must have contiguous timestamps."
             )
 
-        # Group intervals into contiguous groups to preserve holes between groups
-        # but allow consolidation within each contiguous group
+        # Convert period to nanoseconds for calculations
+        period_in_ns = period.value
+
+        # Group intervals by the target period: split only when the gap between files
+        # exceeds one period, since sub-period gaps land in the same consolidated file
+        # anyway. This works for both legacy chunked files (gap ~1ns) and fragment-per-flush
+        # catalogs (gap ~bar interval) without inferring spacing from the data.
         contiguous_groups = []
         current_group = [filtered_intervals[0]]
 
         for i in range(1, len(filtered_intervals)):
-            prev_interval = filtered_intervals[i - 1]
-            curr_interval = filtered_intervals[i]
+            prev_end = filtered_intervals[i - 1][1]
+            curr_start = filtered_intervals[i][0]
 
-            # Check if current interval is contiguous with previous (end + 1 == start)
-            if prev_interval[1] + 1 == curr_interval[0]:
-                current_group.append(curr_interval)
-            else:
-                # Gap found, start new group
+            if curr_start - prev_end > period_in_ns:
                 contiguous_groups.append(current_group)
-                current_group = [curr_interval]
+                current_group = [filtered_intervals[i]]
+            else:
+                current_group.append(filtered_intervals[i])
 
-        # Add the last group
         contiguous_groups.append(current_group)
-
-        # Convert period to nanoseconds for calculations
-        period_in_ns = period.value
 
         # Start with split queries for data preservation
         queries_to_execute = []
@@ -2000,6 +1999,8 @@ class ParquetDataCatalog(BaseDataCatalog):
             return NautilusDataType.Bar
         elif data_cls == MarkPriceUpdate:
             return NautilusDataType.MarkPriceUpdate
+        elif data_cls == InstrumentStatus:
+            return NautilusDataType.InstrumentStatus
         else:
             return None
 
@@ -2458,7 +2459,6 @@ class ParquetDataCatalog(BaseDataCatalog):
         identifiers: list[str] | None = None,
         return_as_dict: bool = False,
     ) -> list[Data] | dict[str, list[Data]]:
-        class_mapping: dict[str, type] = {class_to_filename(cls): cls for cls in list_schemas()}
         data = defaultdict(list)
 
         for feather_file in self._list_feather_files(kind, instance_id, data_cls, identifiers):
@@ -2474,8 +2474,11 @@ class ParquetDataCatalog(BaseDataCatalog):
                 continue
 
             try:
-                data_cls = class_mapping[cls_name]
-                data_objects = self._handle_table_nautilus(table=table, data_cls=data_cls)
+                mapped_cls = filename_to_class(cls_name)
+                if mapped_cls is None:
+                    raise KeyError(cls_name)
+
+                data_objects = self._handle_table_nautilus(table=table, data_cls=mapped_cls)
                 data[cls_name].extend(data_objects)
             except Exception as e:
                 if raise_on_failed_deserialize:
@@ -2776,15 +2779,13 @@ class ParquetDataCatalog(BaseDataCatalog):
             subdirs = self._list_directory_stems(f"{kind}/{urisafe_identifier(instance_id)}")
             discovered_classes.update(subdirs)
 
-            # Use _list_feather_data_files for each discovered class
-            class_mapping: dict[str, type] = {class_to_filename(cls): cls for cls in list_schemas()}
-
             for cls_name in discovered_classes:
-                if cls_name in class_mapping:
+                data_cls = filename_to_class(cls_name)
+                if data_cls is not None:
                     yield from self._list_feather_data_files(
                         kind,
                         instance_id,
-                        class_mapping[cls_name],
+                        data_cls,
                         identifiers,
                     )
 
